@@ -56,257 +56,222 @@ import java.util.Map;
 public class AgentOrchestrator {
 
     private static final Logger log = LoggerFactory.getLogger(AgentOrchestrator.class);
+    private static final int SUMMARISE_EVERY = 5;
+    private static final int CHARS_PER_TOKEN = 4;
 
     @Value("${agent.max-iterations:10}")
     private int maxIterations;
+
+    @Value("${agent.max-cost-tokens:5000}")
+    private int maxCostTokens;
 
     private final ChatClient chatClient;
     private final ToolRegistry toolRegistry;
     private final ObjectMapper objectMapper;
 
     public AgentOrchestrator(ChatClient.Builder chatClientBuilder,
-                              ToolRegistry toolRegistry,
-                              ObjectMapper objectMapper) {
+                             ToolRegistry toolRegistry,
+                             ObjectMapper objectMapper) {
         this.chatClient   = chatClientBuilder.build();
         this.toolRegistry = toolRegistry;
         this.objectMapper = objectMapper;
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // PUBLIC API
-    // ──────────────────────────────────────────────────────────────────────────
-
-    /**
-     * Run the ReAct loop for the given task.
-     * This is the only method the controller calls.
-     */
     public AgentResponse run(String task) {
         long startMs = System.currentTimeMillis();
-
         log.info("Agent starting. Task: '{}'", task);
 
-        // The conversation history — grows with each iteration
-        // Format: alternating user/assistant turns
-        List<String> history = new ArrayList<>();
-
-        // Track which tools were called, in order
+        List<String> history      = new ArrayList<>();
         List<String> toolsInvoked = new ArrayList<>();
-
-        int iteration = 0;
+        int    iteration   = 0;
+        int    totalTokens = 0;
         String finalAnswer = null;
-        boolean hitLimit = false;
+        boolean hitLimit   = false;
 
-        // ── REACT LOOP ────────────────────────────────────────────────────────
         while (iteration < maxIterations) {
             iteration++;
-            log.debug("── Iteration {} / {} ──────────────────────", iteration, maxIterations);
+            log.debug("-- Iteration {} / {} --", iteration, maxIterations);
 
-            // 1. Build the full prompt for this iteration
+            // Guardrail 1: Summarise history every N iterations
+            if (iteration > 1 && (iteration - 1) % SUMMARISE_EVERY == 0) {
+                log.debug("Summarising history at iteration {}", iteration);
+                history =  summariseHistory(history, task);
+            }
+
             String prompt = buildPrompt(task, history);
 
-            // 2. Call the LLM
-            String rawLlmResponse;
-            try {
-                rawLlmResponse = callLlm(prompt);
-                log.debug("LLM raw response:\n{}", rawLlmResponse);
-            } catch (Exception e) {
-                log.error("LLM call failed on iteration {}: {}", iteration, e.getMessage());
-                finalAnswer = "Agent failed: LLM call error — " + e.getMessage();
+            // Guardrail 2: Cost budget check
+            int promptTokens = estimateTokens(prompt);
+            if (totalTokens + promptTokens > maxCostTokens) {
+                hitLimit   = true;
+                finalAnswer = "Agent stopped: cost budget exceeded ("
+                        + totalTokens + " / " + maxCostTokens + " tokens). "
+                        + "Tools invoked: " + toolsInvoked;
+                log.warn("Cost budget exceeded. Tokens used: {}", totalTokens);
                 break;
             }
 
-            // 3. Parse the LLM's decision
+            String rawResponse;
+            try {
+                rawResponse  = callLlm(prompt);
+                totalTokens += estimateTokens(prompt) + estimateTokens(rawResponse);
+                log.debug("Tokens this iteration: ~{}. Total: ~{}",
+                        estimateTokens(rawResponse), totalTokens);
+            } catch (Exception e) {
+                log.error("LLM call failed: {}", e.getMessage());
+                finalAnswer = "Agent failed: LLM error — " + e.getMessage();
+                break;
+            }
+
             LlmDecision decision;
             try {
-                decision = parseDecision(rawLlmResponse);
+                decision = parseDecision(rawResponse);
+                log.debug("Thought: {}", decision.thought());
             } catch (Exception e) {
-                log.warn("Failed to parse LLM response on iteration {}. Raw: {}", iteration, rawLlmResponse);
-                // Inject an error into history and let the agent retry
-                history.add("SYSTEM: Your last response could not be parsed. "
-                        + "You MUST respond with valid JSON matching the required format.");
+                log.warn("Parse failed on iteration {}. Injecting correction.", iteration);
+                history.add("SYSTEM: Your last response was not valid JSON. Respond ONLY with the JSON format specified.");
                 continue;
             }
 
-            log.debug("Thought: {}", decision.thought());
-
-            // 4a. Final answer — we're done
             if (decision.isFinalAnswer()) {
                 finalAnswer = decision.finalAnswer();
-                log.info("Agent reached final answer after {} iteration(s).", iteration);
+                log.info("Final answer after {} iteration(s). Tokens: ~{}", iteration, totalTokens);
                 break;
             }
 
-            // 4b. Tool call — execute and inject observation
             if (decision.isToolCall()) {
                 ToolCall tc = decision.toolCall();
-                log.debug("Tool call: {} with args {}", tc.toolName(), tc.args());
+                log.debug("Tool call: {} args: {}", tc.toolName(), tc.args());
+
+                // Guardrail 3: Validate args before executing
+                String validationError = validateToolArgs(tc);
+                if (validationError != null) {
+                    log.warn("Tool arg validation failed: {}", validationError);
+                    history.add("Assistant thought: " + decision.thought() + "\nAction: " + tc.toolName());
+                    history.add("Observation: VALIDATION ERROR — " + validationError + " Please retry with correct arguments.");
+                    continue;
+                }
 
                 toolsInvoked.add(tc.toolName());
-
                 String observation = toolRegistry.execute(tc.toolName(), tc.args());
                 log.debug("Observation: {}", observation);
 
-                // Build the turn for history
-                // Assistant turn (what the LLM said)
                 history.add("Assistant thought: " + decision.thought()
                         + "\nAction: " + tc.toolName()
                         + "\nAction input: " + tc.args());
-
-                // User turn (the tool observation injected back)
                 history.add("Observation: " + observation);
             }
         }
-        // ── END REACT LOOP ────────────────────────────────────────────────────
 
-        // If the loop ended without a final answer, we hit the iteration cap
         if (finalAnswer == null) {
-            hitLimit = true;
-            finalAnswer = "Agent reached the maximum iteration limit ("
-                    + maxIterations + ") without producing a final answer. "
-                    + "Tools invoked: " + toolsInvoked + ". "
-                    + "Try simplifying the task or increasing the iteration limit.";
-            log.warn("Agent hit iteration limit ({}) for task: '{}'", maxIterations, task);
+            hitLimit    = true;
+            finalAnswer = "Agent reached iteration limit (" + maxIterations + "). Tools: " + toolsInvoked;
+            log.warn("Agent hit iteration limit for task: '{}'", task);
         }
 
         long durationMs = System.currentTimeMillis() - startMs;
-        log.info("Agent completed. Iterations: {}, Tools: {}, Duration: {}ms",
-                iteration, toolsInvoked, durationMs);
+        log.info("Agent done. Iterations: {}, Tokens: ~{}, Tools: {}, Duration: {}ms",
+                iteration, totalTokens, toolsInvoked, durationMs);
 
-        return new AgentResponse(
-                finalAnswer,
-                iteration,
-                maxIterations,
-                toolsInvoked,
-                hitLimit,
-                durationMs
-        );
+        return new AgentResponse(finalAnswer, iteration, maxIterations, toolsInvoked, hitLimit, durationMs);
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // PRIVATE — PROMPT BUILDING
-    // ──────────────────────────────────────────────────────────────────────────
+    // ── Guardrail 1: History summarisation ───────────────────────────────────
+    private List<String> summariseHistory(List<String> history, String task) {
+        if (history.isEmpty()) return history;
 
-    /**
-     * Assembles the full prompt for one LLM call.
-     *
-     * Structure:
-     *   [SYSTEM PROMPT — who you are, what tools exist, how to respond]
-     *   [TASK]
-     *   [HISTORY — all previous thoughts, actions, observations]
-     *   [INSTRUCTION — what to do next]
-     */
+        String prompt = """
+                Summarise the progress of an AI agent working on this task: %s
+                
+                Steps so far:
+                %s
+                
+                Write 3-5 sentences covering: tools called, what they returned, what is still needed.
+                Be factual. Include all key data from observations.
+                """.formatted(task, String.join("\n\n", history));
+
+        try {
+            String summary = callLlm(prompt);
+            log.debug("History summarised. Was {} entries.", history.size());
+            return new ArrayList<>(List.of("PROGRESS SUMMARY:\n" + summary));
+        } catch (Exception e) {
+            log.warn("Summarisation failed, keeping raw history: {}", e.getMessage());
+            return history;
+        }
+    }
+
+    // ── Guardrail 2: Token estimation ─────────────────────────────────────────
+    private int estimateTokens(String text) {
+        if (text == null || text.isBlank()) return 0;
+        return text.length() / CHARS_PER_TOKEN;
+    }
+
+    // ── Guardrail 3: Tool arg validation ──────────────────────────────────────
+    private String validateToolArgs(ToolCall tc) {
+        if (toolRegistry.getTool(tc.toolName()).isEmpty()) {
+            return "Tool '" + tc.toolName() + "' does not exist. Available: " + toolRegistry.getAllTools().keySet();
+        }
+        return switch (tc.toolName()) {
+            case "get_weather" -> {
+                if (!tc.args().containsKey("city") || tc.args().get("city").isBlank())
+                    yield "Tool 'get_weather' requires arg 'city'. Example: {\"city\": \"Bengaluru\"}";
+                yield null;
+            }
+            default -> null;
+        };
+    }
+
+    // ── Prompt builder ────────────────────────────────────────────────────────
     private String buildPrompt(String task, List<String> history) {
         StringBuilder sb = new StringBuilder();
-
-        // ── System prompt ──────────────────────────────────────────────────
+        sb.append("You are an AI agent that solves tasks step by step using available tools.\n\n");
+        sb.append("AVAILABLE TOOLS:\n").append(toolRegistry.getToolDescriptions()).append("\n\n");
         sb.append("""
-                You are an AI agent that solves tasks step by step using available tools.
-                
-                AVAILABLE TOOLS:
-                """);
-        sb.append(toolRegistry.getToolDescriptions()).append("\n\n");
-
-        sb.append("""
-                RESPONSE FORMAT (strict JSON — no other format accepted):
-                
-                If you need to call a tool:
-                {
-                  "thought": "your reasoning about what to do next",
-                  "action": "tool_name",
-                  "action_input": {"key": "value"}
-                }
-                
-                If you have enough information to answer:
-                {
-                  "thought": "your reasoning about why you can now answer",
-                  "final_answer": "your complete answer to the user"
-                }
-                
-                RULES:
-                - Always include "thought" in every response.
-                - Use a tool only when you actually need information you don't have.
-                - Do not make up tool results. Always call the tool and use the observation.
-                - When you have the information needed, give the final_answer immediately.
-                - Respond ONLY with the JSON object. No preamble, no markdown, no explanation outside the JSON.
+                RESPONSE FORMAT (strict JSON only):
+                To call a tool: {"thought": "reasoning", "action": "tool_name", "action_input": {"key": "value"}}
+                To give final answer: {"thought": "reasoning", "final_answer": "your answer"}
+                RULES: Always include "thought". Never fabricate tool results. Respond ONLY with JSON.
                 
                 """);
-
-        // ── Task ──────────────────────────────────────────────────────────
         sb.append("TASK: ").append(task).append("\n\n");
-
-        // ── History ───────────────────────────────────────────────────────
         if (!history.isEmpty()) {
             sb.append("PREVIOUS STEPS:\n");
-            for (String turn : history) {
-                sb.append(turn).append("\n\n");
-            }
+            history.forEach(h -> sb.append(h).append("\n\n"));
         }
-
-        sb.append("Now respond with the next step as JSON:");
-
+        sb.append("Next step (JSON only):");
         return sb.toString();
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // PRIVATE — LLM CALL
-    // ──────────────────────────────────────────────────────────────────────────
-
+    // ── LLM call ──────────────────────────────────────────────────────────────
     private String callLlm(String prompt) {
-        return chatClient
-                .prompt()
-                .user(prompt)
-                .call()
-                .content();
+        return chatClient.prompt().user(prompt).call().content();
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // PRIVATE — RESPONSE PARSING
-    // ──────────────────────────────────────────────────────────────────────────
-
-    /**
-     * Parses the LLM's JSON response into an LlmDecision.
-     *
-     * The LLM sometimes wraps its JSON in markdown code fences (```json ... ```).
-     * We strip those before parsing.
-     */
+    // ── Response parser ───────────────────────────────────────────────────────
     private LlmDecision parseDecision(String raw) throws Exception {
-        // Strip markdown code fences if present
         String json = raw.trim();
         if (json.startsWith("```")) {
             json = json.replaceAll("^```[a-zA-Z]*\\n?", "").replaceAll("```$", "").trim();
         }
-
         JsonNode root;
         try {
             root = objectMapper.readTree(json);
         } catch (Exception e) {
-            throw new IllegalArgumentException("LLM response is not valid JSON: " + raw);
+            throw new IllegalArgumentException("Not valid JSON: " + raw);
         }
-
         String thought = root.path("thought").asText("");
-
-        // Final answer path
         if (root.has("final_answer") && !root.path("final_answer").asText().isBlank()) {
             return new LlmDecision(thought, null, root.path("final_answer").asText());
         }
-
-        // Tool call path
         if (root.has("action") && !root.path("action").asText().isBlank()) {
             String toolName = root.path("action").asText();
-
             Map<String, String> args = new HashMap<>();
-            JsonNode actionInput = root.path("action_input");
-            if (actionInput.isObject()) {
-                actionInput.fields().forEachRemaining(entry ->
-                        args.put(entry.getKey(), entry.getValue().asText())
-                );
+            JsonNode input = root.path("action_input");
+            if (input.isObject()) {
+                input.fields().forEachRemaining(e -> args.put(e.getKey(), e.getValue().asText()));
             }
-
             return new LlmDecision(thought, new ToolCall(toolName, args), null);
         }
-
-        // Neither final_answer nor action — the LLM didn't follow the format
-        throw new IllegalArgumentException(
-                "LLM response has neither 'final_answer' nor 'action': " + raw);
+        throw new IllegalArgumentException("No 'final_answer' or 'action' in: " + raw);
     }
 }
