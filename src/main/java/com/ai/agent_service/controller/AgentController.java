@@ -1,5 +1,6 @@
 package com.ai.agent_service.controller;
 
+import com.ai.agent_service.evaluator.AgentEvaluator;
 import com.ai.agent_service.model.AgentRequest;
 import com.ai.agent_service.model.AgentResponse;
 import com.ai.agent_service.orchestrator.AgentOrchestrator;
@@ -29,10 +30,12 @@ public class AgentController {
 
     private final AgentOrchestrator orchestrator;
     private final ToolRegistry toolRegistry;
+    private final AgentEvaluator evaluator;
 
-    public AgentController(AgentOrchestrator orchestrator, ToolRegistry toolRegistry) {
+    public AgentController(AgentOrchestrator orchestrator, ToolRegistry toolRegistry, AgentEvaluator evaluator) {
         this.orchestrator = orchestrator;
         this.toolRegistry = toolRegistry;
+        this.evaluator = evaluator;
     }
 
     // ── POST /agent ───────────────────────────────────────────────────────────
@@ -83,5 +86,12 @@ public class AgentController {
                 "status", "UP",
                 "toolsLoaded", toolRegistry.getToolCount()
         ));
+    }
+
+    @GetMapping("/eval")
+    public ResponseEntity<?> runEval() {
+        log.info("GET /agent/eval — running evaluation suite");
+        AgentEvaluator.EvalReport report = evaluator.runAll();
+        return ResponseEntity.ok(report);
     }
 }
