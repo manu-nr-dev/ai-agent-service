@@ -27,6 +27,7 @@ import java.util.Map;
  */
 @RestController
 @RequestMapping("/agent")
+@CrossOrigin(origins = "http://localhost:4200")
 public class AgentController {
 
     private static final Logger log = LoggerFactory.getLogger(AgentController.class);

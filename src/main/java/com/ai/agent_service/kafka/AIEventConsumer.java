@@ -3,6 +3,7 @@ package com.ai.agent_service.kafka;
 import com.ai.agent_service.exception.BudgetExceededException;
 import com.ai.agent_service.model.AIRequestEvent;
 import com.ai.agent_service.model.AIResultEvent;
+import com.ai.agent_service.model.AgentResponse;
 import com.ai.agent_service.model.ResultStatus;
 import com.ai.agent_service.orchestrator.AgentOrchestrator;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -47,8 +48,12 @@ public class AIEventConsumer {
 
         long start = System.currentTimeMillis();
         try {
-            String output = String.valueOf(orchestrator.run(event.getPrompt()));
-            result.setResult(output);
+            AgentResponse agentResponse = orchestrator.run(event.getPrompt());
+            result.setAnswer(agentResponse.answer());
+            result.setIterationsUsed(agentResponse.iterationsUsed());
+            result.setToolsInvoked(agentResponse.toolsInvoked());
+            result.setHitIterationLimit(agentResponse.hitIterationLimit());
+            result.setDurationMs(agentResponse.durationMs());
             result.setStatus(ResultStatus.SUCCESS);
         } catch (BudgetExceededException e) {
             result.setStatus(ResultStatus.BUDGET_EXCEEDED);
