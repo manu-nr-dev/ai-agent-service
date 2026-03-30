@@ -1,14 +1,20 @@
 package com.ai.agent_service.evaluator;
 
+import com.ai.agent_service.kafka.AIEventProducer;
+import com.ai.agent_service.model.AIRequestEvent;
 import com.ai.agent_service.orchestrator.AgentOrchestrator;
 import com.ai.agent_service.model.AgentResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Component;
 
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 
 /**
  * Day 40: Agent evaluation suite.
@@ -25,10 +31,19 @@ public class AgentEvaluator {
     private static final Logger log = LoggerFactory.getLogger(AgentEvaluator.class);
 
     private final AgentOrchestrator orchestrator;
+    private final JdbcTemplate jdbc;
+    private final KafkaTemplate<String, Object> kafkaTemplate;
 
-    public AgentEvaluator(AgentOrchestrator orchestrator) {
+    public AgentEvaluator(AgentOrchestrator orchestrator, JdbcTemplate jdbc, KafkaTemplate<String, Object> kafkaTemplate, AIEventProducer producer) {
         this.orchestrator = orchestrator;
+        this.jdbc = jdbc;
+        this.kafkaTemplate = kafkaTemplate;
+        this.producer = producer;
     }
+
+    private final AIEventProducer producer;
+
+    private record AsyncResult(String requestId, String status) {}
 
     public EvalReport runAll() {
         List<EvalResult> results = new ArrayList<>();
@@ -38,6 +53,10 @@ public class AgentEvaluator {
         results.add(evalInvalidToolHandled());
         results.add(evalWeatherToolWorks());
         results.add(evalDBToolWorks());
+        results.add(evalAsyncSuccess());
+        results.add(evalAsyncBudgetExceeded());
+        results.add(evalAsyncDuplicate());
+        results.add(evalAsyncToolFail());
 
         long passed = results.stream().filter(EvalResult::passed).count();
         log.info("Eval complete: {}/{} passed", passed, results.size());
@@ -152,5 +171,101 @@ public class AgentEvaluator {
         public String summary() {
             return passed + "/" + total + " passed";
         }
+    }
+
+    // ── Case 6: Async success ─────────────────────────────────────────────────
+    private EvalResult evalAsyncSuccess() {
+        String task = "What products are available?";
+        log.info("Eval 6: async success");
+        try {
+            String requestId = producer.publish("eval-user", task, "REACT", 5000);
+            AsyncResult result = pollForResult(requestId, 30);
+            boolean passed = result != null && "SUCCESS".equals(result.status());
+            return new EvalResult("async_success", task,
+                    "status=SUCCESS",
+                    result != null ? "status=" + result.status() : "timeout",
+                    passed);
+        } catch (Exception e) {
+            return new EvalResult("async_success", task, "status=SUCCESS", e.getMessage(), false);
+        }
+    }
+
+    // ── Case 7: Budget exceeded ───────────────────────────────────────────────
+    private EvalResult evalAsyncBudgetExceeded() {
+        String task = "List every product in extreme detail with full descriptions.";
+        log.info("Eval 7: async budget exceeded");
+        try {
+            String requestId = producer.publish("eval-user", task, "REACT", 100); // tiny budget
+            AsyncResult result = pollForResult(requestId, 30);
+            boolean passed = result != null && "BUDGET_EXCEEDED".equals(result.status());
+            return new EvalResult("async_budget_exceeded", task,
+                    "status=BUDGET_EXCEEDED",
+                    result != null ? "status=" + result.status() : "timeout",
+                    passed);
+        } catch (Exception e) {
+            return new EvalResult("async_budget_exceeded", task, "status=BUDGET_EXCEEDED", e.getMessage(), false);
+        }
+    }
+
+    // ── Case 8: Duplicate request ─────────────────────────────────────────────
+    private EvalResult evalAsyncDuplicate() {
+        String task = "What is the current time?";
+        log.info("Eval 8: async duplicate");
+        try {
+            String requestId = producer.publish("eval-user", task, "REACT", 5000);
+            pollForResult(requestId, 30); // wait for first to complete
+            // publish same requestId manually
+            AIRequestEvent duplicate = new AIRequestEvent();
+            duplicate.setRequestId(requestId); // same ID
+            duplicate.setCorrelationId(UUID.randomUUID().toString());
+            duplicate.setUserId("eval-user");
+            duplicate.setPrompt(task);
+            duplicate.setAgentType("REACT");
+            duplicate.setMaxTokenBudget(5000);
+            duplicate.setCreatedAt(Instant.now());
+            kafkaTemplate.send("ai.requests", "eval-user", duplicate);
+            AsyncResult result = pollForResult(requestId, 15);
+            boolean passed = result != null && "DUPLICATE".equals(result.status());
+            return new EvalResult("async_duplicate", task,
+                    "status=DUPLICATE",
+                    result != null ? "status=" + result.status() : "timeout",
+                    passed);
+        } catch (Exception e) {
+            return new EvalResult("async_duplicate", task, "status=DUPLICATE", e.getMessage(), false);
+        }
+    }
+
+    // ── Case 9: Tool arg validation fails ─────────────────────────────────────
+    private EvalResult evalAsyncToolFail() {
+        String task = "Get weather for"; // missing city
+        log.info("Eval 9: async tool fail");
+        try {
+            String requestId = producer.publish("eval-user", task, "REACT", 5000);
+            AsyncResult result = pollForResult(requestId, 30);
+            boolean passed = result != null &&
+                    ("FAILED".equals(result.status()) || "SUCCESS".equals(result.status()));
+            return new EvalResult("async_tool_fail", task,
+                    "FAILED or graceful SUCCESS",
+                    result != null ? "status=" + result.status() : "timeout",
+                    passed);
+        } catch (Exception e) {
+            return new EvalResult("async_tool_fail", task, "no exception", e.getMessage(), false);
+        }
+    }
+
+    // ── Poll helper ───────────────────────────────────────────────────────────
+    private AsyncResult pollForResult(String requestId, int timeoutSeconds)
+            throws InterruptedException {
+        int attempts = timeoutSeconds / 2;
+        for (int i = 0; i < attempts; i++) {
+            Thread.sleep(2000);
+            List<String> rows = jdbc.query(
+                    "SELECT status FROM agent_results WHERE request_id = ?",
+                    (rs, n) -> rs.getString("status"),
+                    requestId
+            );
+            if (!rows.isEmpty()) return new AsyncResult(requestId,rows.get(0));
+        }
+        return null;
     }
 }

@@ -1,4 +1,4 @@
-package com.ai.agent_service.controller;
+package com.ai.agent_service.exception;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
