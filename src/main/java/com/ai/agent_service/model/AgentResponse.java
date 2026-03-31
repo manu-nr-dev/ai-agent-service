@@ -14,5 +14,6 @@ public record AgentResponse(
         int maxIterations,          // The hard cap that was set
         List<String> toolsInvoked,  // Which tools were called, in order
         boolean hitIterationLimit,  // true if agent stopped because cap was reached
-        long durationMs             // Total wall time for the agent run
+        long durationMs,             // Total wall time for the agent run
+        int totalTokensUsed
 ) {}

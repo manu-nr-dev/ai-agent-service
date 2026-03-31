@@ -4,6 +4,7 @@ import com.ai.agent_service.kafka.KafkaJsonDeserializer;
 import com.ai.agent_service.kafka.KafkaJsonSerializer;
 import com.ai.agent_service.model.AIRequestEvent;
 import org.apache.kafka.clients.admin.AdminClientConfig;
+import org.springframework.kafka.annotation.EnableKafkaRetryTopic;
 import org.springframework.kafka.listener.ContainerProperties;
 import com.ai.agent_service.model.AIResultEvent;
 import com.fasterxml.jackson.databind.JsonSerializer;
@@ -24,6 +25,7 @@ import java.util.Map;
 
 @Configuration
 @EnableKafka
+@EnableKafkaRetryTopic
 public class KafkaConfig {
 
     private static final String BOOTSTRAP_SERVERS = "localhost:9092";

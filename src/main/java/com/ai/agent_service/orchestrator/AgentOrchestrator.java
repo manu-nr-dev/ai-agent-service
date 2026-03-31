@@ -173,7 +173,7 @@ public class AgentOrchestrator {
         log.info("Agent done. Iterations: {}, Tokens: ~{}, Tools: {}, Duration: {}ms",
                 iteration, totalTokens, toolsInvoked, durationMs);
 
-        return new AgentResponse(finalAnswer, iteration, maxIterations, toolsInvoked, hitLimit, durationMs);
+        return new AgentResponse(finalAnswer, iteration, maxIterations, toolsInvoked, hitLimit, durationMs,totalTokens);
     }
 
     // ── Guardrail 1: History summarisation ───────────────────────────────────
