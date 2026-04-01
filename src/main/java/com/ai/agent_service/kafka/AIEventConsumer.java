@@ -11,6 +11,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.stereotype.Component;
 
 import java.time.Instant;
@@ -34,7 +35,7 @@ public class AIEventConsumer {
     }
 
     @KafkaListener(topics = "ai.requests", containerFactory = "kafkaListenerContainerFactory")
-    public void consume(AIRequestEvent event) throws InterruptedException {
+    public void consume(AIRequestEvent event, Acknowledgment ack) throws InterruptedException {
         AIResultEvent result = new AIResultEvent();
         result.setRequestId(event.getRequestId());
         result.setCorrelationId(event.getCorrelationId());
@@ -44,6 +45,7 @@ public class AIEventConsumer {
         if (isAlreadyProcessed(event.getRequestId())) {
             result.setStatus(ResultStatus.DUPLICATE);
             kafkaTemplate.send("ai.results", event.getUserId(), result);
+            ack.acknowledge();
             return;
         }
 
@@ -65,21 +67,24 @@ public class AIEventConsumer {
                 result.setStatus(ResultStatus.SUCCESS);
                 result.setProcessingMs(System.currentTimeMillis() - start);
                 kafkaTemplate.send("ai.results", event.getUserId(), result);
+                ack.acknowledge();
                 return;
             } catch (BudgetExceededException e) {
                 result.setStatus(ResultStatus.BUDGET_EXCEEDED);
                 result.setErrorMessage(e.getMessage());
                 result.setProcessingMs(System.currentTimeMillis() - start);
                 kafkaTemplate.send("ai.results", event.getUserId(), result);
+                ack.acknowledge();
                 return;
             } catch (Exception e) {
                 attempt++;
                 if (attempt > maxRetries) {
                     log.error("All retries exhausted for requestId={}", event.getRequestId(), e);
                     sendToDlt(event, e.getMessage());
+                    ack.acknowledge();
                     return;
                 }
-                long backoff = (long) (1000 * Math.pow(2, attempt - 1)); // 1s, 2s, 4s
+                long backoff = (long) (1000 * Math.pow(2, attempt - 1));
                 log.warn("Retry {}/{} for requestId={}, backoff={}ms", attempt, maxRetries, event.getRequestId(), backoff);
                 Thread.sleep(backoff);
             }

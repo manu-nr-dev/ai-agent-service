@@ -248,7 +248,7 @@ public class AgentOrchestrator {
     }
 
     // ── Response parser ───────────────────────────────────────────────────────
-    private LlmDecision parseDecision(String raw) throws Exception {
+    private LlmDecision parseDecision(String raw){
         String json = raw.trim();
         if (json.startsWith("```")) {
             json = json.replaceAll("^```[a-zA-Z]*\\n?", "").replaceAll("```$", "").trim();
