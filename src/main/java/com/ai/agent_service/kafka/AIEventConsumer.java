@@ -16,6 +16,8 @@ import org.springframework.stereotype.Component;
 
 import java.time.Instant;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
 
 @Component
 public class AIEventConsumer {
@@ -25,13 +27,13 @@ public class AIEventConsumer {
     private final AgentOrchestrator orchestrator;
     private final KafkaTemplate<String, Object> kafkaTemplate;
     private final JdbcTemplate jdbc;
+    private ExecutorService virtualThreadExecutor;
 
-    public AIEventConsumer(AgentOrchestrator orchestrator,
-                           KafkaTemplate<String, Object> kafkaTemplate,
-                           JdbcTemplate jdbc) {
-        this.orchestrator = orchestrator;
-        this.kafkaTemplate = kafkaTemplate;
+    public AIEventConsumer(ExecutorService virtualThreadExecutor, JdbcTemplate jdbc, KafkaTemplate<String, Object> kafkaTemplate, AgentOrchestrator orchestrator) {
+        this.virtualThreadExecutor = virtualThreadExecutor;
         this.jdbc = jdbc;
+        this.kafkaTemplate = kafkaTemplate;
+        this.orchestrator = orchestrator;
     }
 
     @KafkaListener(topics = "ai.requests", containerFactory = "kafkaListenerContainerFactory")
@@ -57,7 +59,9 @@ public class AIEventConsumer {
 
         while (attempt <= maxRetries) {
             try {
-                AgentResponse agentResponse = orchestrator.run(event.getPrompt());
+                AgentResponse agentResponse = CompletableFuture
+                        .supplyAsync(() -> orchestrator.run(event.getPrompt()), virtualThreadExecutor)
+                        .join();
                 result.setAnswer(agentResponse.answer());
                 result.setIterationsUsed(agentResponse.iterationsUsed());
                 result.setToolsInvoked(agentResponse.toolsInvoked());
