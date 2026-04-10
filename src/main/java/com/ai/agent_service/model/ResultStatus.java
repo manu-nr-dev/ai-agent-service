@@ -5,5 +5,6 @@ public enum ResultStatus {
     FAILED,
     BUDGET_EXCEEDED,
     TIMEOUT,
-    DUPLICATE
+    DUPLICATE,
+    ITERATION_LIMIT
 }

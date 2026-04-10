@@ -4,6 +4,7 @@ import com.ai.agent_service.evaluator.AgentEvaluator;
 import com.ai.agent_service.kafka.AIEventProducer;
 import com.ai.agent_service.model.AgentRequest;
 import com.ai.agent_service.model.AgentResponse;
+import com.ai.agent_service.model.*;
 import com.ai.agent_service.orchestrator.AgentOrchestrator;
 import com.ai.agent_service.tool.ToolRegistry;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -66,10 +67,22 @@ public class AgentController {
 
         AgentResponse response = orchestrator.run(request.task());
 
-        log.info("POST /agent completed — {}ms, iterations: {}, tools: {}",
-                System.currentTimeMillis() - start,
-                response.iterationsUsed(),
-                response.toolsInvoked());
+        switch (response) {
+            case SuccessResponse(var answer, var iterationsUsed, var maxIterations,
+                                 var toolsInvoked, var durationMs, var totalTokensUsed) ->
+                    log.info("POST /agent completed — {}ms, iterations: {}, tools: {}",
+                            System.currentTimeMillis() - start, iterationsUsed, toolsInvoked);
+            case BudgetExceededResponse(var totalTokensUsed, var maxCostTokens,
+                                        var toolsInvoked, var durationMs) ->
+                    log.warn("POST /agent budget exceeded — tokens: {}/{}, tools: {}",
+                            totalTokensUsed, maxCostTokens, toolsInvoked);
+            case ErrorResponse(var message, var toolsInvoked, var durationMs, var totalTokensUsed) ->
+                    log.error("POST /agent failed — {}, tools: {}", message, toolsInvoked);
+            case IterationLimitResponse(var maxIterations, var toolsInvoked,
+                                        var durationMs, var totalTokensUsed) ->
+                    log.warn("POST /agent hit iteration limit — max: {}, tools: {}",
+                            maxIterations, toolsInvoked);
+        }
 
         // If agent hit a limit, return 200 with the partial answer
         // (it's not a server error — the agent ran, just didn't fully complete)

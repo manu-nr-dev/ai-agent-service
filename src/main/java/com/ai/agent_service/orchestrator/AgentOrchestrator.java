@@ -1,8 +1,6 @@
 package com.ai.agent_service.orchestrator;
 
-import com.ai.agent_service.model.ToolCall;
-import com.ai.agent_service.model.AgentResponse;
-import com.ai.agent_service.model.LlmDecision;
+import com.ai.agent_service.model.*;
 import com.ai.agent_service.tool.ToolRegistry;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -83,32 +81,26 @@ public class AgentOrchestrator {
 
         List<String> history      = new ArrayList<>();
         List<String> toolsInvoked = new ArrayList<>();
-        int    iteration   = 0;
-        int    totalTokens = 0;
-        String finalAnswer = null;
-        boolean hitLimit   = false;
+        int     iteration   = 0;
+        int     totalTokens = 0;
 
         while (iteration < maxIterations) {
             iteration++;
             log.debug("-- Iteration {} / {} --", iteration, maxIterations);
 
-            // Guardrail 1: Summarise history every N iterations
             if (iteration > 1 && (iteration - 1) % SUMMARISE_EVERY == 0) {
                 log.debug("Summarising history at iteration {}", iteration);
-                history =  summariseHistory(history, task);
+                history = summariseHistory(history, task);
             }
 
             String prompt = buildPrompt(task, history);
 
-            // Guardrail 2: Cost budget check
             int promptTokens = estimateTokens(prompt);
             if (totalTokens + promptTokens > maxCostTokens) {
-                hitLimit   = true;
-                finalAnswer = "Agent stopped: cost budget exceeded ("
-                        + totalTokens + " / " + maxCostTokens + " tokens). "
-                        + "Tools invoked: " + toolsInvoked;
                 log.warn("Cost budget exceeded. Tokens used: {}", totalTokens);
-                break;
+                return new BudgetExceededResponse(
+                        totalTokens, maxCostTokens, toolsInvoked,
+                        System.currentTimeMillis() - startMs);
             }
 
             String rawResponse;
@@ -119,8 +111,9 @@ public class AgentOrchestrator {
                         estimateTokens(rawResponse), totalTokens);
             } catch (Exception e) {
                 log.error("LLM call failed: {}", e.getMessage());
-                finalAnswer = "Agent failed: LLM error — " + e.getMessage();
-                break;
+                return new ErrorResponse(
+                        e.getMessage(), toolsInvoked,
+                        System.currentTimeMillis() - startMs, totalTokens);
             }
 
             LlmDecision decision;
@@ -134,16 +127,16 @@ public class AgentOrchestrator {
             }
 
             if (decision.isFinalAnswer()) {
-                finalAnswer = decision.finalAnswer();
                 log.info("Final answer after {} iteration(s). Tokens: ~{}", iteration, totalTokens);
-                break;
+                return new SuccessResponse(
+                        decision.finalAnswer(), iteration, maxIterations, toolsInvoked,
+                        System.currentTimeMillis() - startMs, totalTokens);
             }
 
             if (decision.isToolCall()) {
                 ToolCall tc = decision.toolCall();
                 log.debug("Tool call: {} args: {}", tc.toolName(), tc.args());
 
-                // Guardrail 3: Validate args before executing
                 String validationError = validateToolArgs(tc);
                 if (validationError != null) {
                     log.warn("Tool arg validation failed: {}", validationError);
@@ -163,17 +156,10 @@ public class AgentOrchestrator {
             }
         }
 
-        if (finalAnswer == null) {
-            hitLimit    = true;
-            finalAnswer = "Agent reached iteration limit (" + maxIterations + "). Tools: " + toolsInvoked;
-            log.warn("Agent hit iteration limit for task: '{}'", task);
-        }
-
-        long durationMs = System.currentTimeMillis() - startMs;
-        log.info("Agent done. Iterations: {}, Tokens: ~{}, Tools: {}, Duration: {}ms",
-                iteration, totalTokens, toolsInvoked, durationMs);
-
-        return new AgentResponse(finalAnswer, iteration, maxIterations, toolsInvoked, hitLimit, durationMs,totalTokens);
+        log.warn("Agent hit iteration limit for task: '{}'", task);
+        return new IterationLimitResponse(
+                maxIterations, toolsInvoked,
+                System.currentTimeMillis() - startMs, totalTokens);
     }
 
     // ── Guardrail 1: History summarisation ───────────────────────────────────
