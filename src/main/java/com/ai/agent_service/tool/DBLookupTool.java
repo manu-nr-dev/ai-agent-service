@@ -1,5 +1,6 @@
 package com.ai.agent_service.tool;
 
+import com.ai.agent_service.model.AgentContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -45,6 +46,9 @@ public class DBLookupTool implements ToolFunction {
 
     @Override
     public String execute(Map<String, String> args) {
+        String requestId = AgentContext.REQUEST_ID.orElse("unknown");
+        log.debug("[requestId={}] db_lookup invoked", requestId);
+
         List<Map<String, Object>> rows;
 
         if (args.containsKey("category")) {

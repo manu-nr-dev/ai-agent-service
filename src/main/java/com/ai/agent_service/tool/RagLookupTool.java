@@ -1,5 +1,6 @@
 package com.ai.agent_service.tool;
 
+import com.ai.agent_service.model.AgentContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -33,6 +34,10 @@ public class RagLookupTool implements ToolFunction {
 
     @Override
     public String execute(Map<String, String> args) throws Exception {
+        String requestId = AgentContext.REQUEST_ID.orElse("unknown");
+        String userId = AgentContext.USER_ID.orElse("unknown");
+        log.debug("[requestId={}] [userId={}] rag_lookup invoked", requestId, userId);
+
         String query = args.get("query");
         if (query == null || query.isBlank()) {
             return "ERROR: 'query' argument is required for rag_lookup.";

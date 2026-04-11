@@ -33,7 +33,7 @@ public class AIEventConsumer {
     }
 
     @KafkaListener(topics = "ai.requests", containerFactory = "kafkaListenerContainerFactory")
-    public void consume(AIRequestEvent event, Acknowledgment ack) throws InterruptedException {
+    public void consume(AIRequestEvent event, Acknowledgment ack) throws Exception {
         AIResultEvent result = new AIResultEvent();
         result.setRequestId(event.getRequestId());
         result.setCorrelationId(event.getCorrelationId());
@@ -49,66 +49,72 @@ public class AIEventConsumer {
 
         markProcessed(event.getRequestId());
 
-        long start = System.currentTimeMillis();
-        int maxRetries = 3;
-        int attempt = 0;
+        ScopedValue.where(AgentContext.REQUEST_ID, event.getRequestId())
+                .where(AgentContext.USER_ID, event.getUserId())
+                .where(AgentContext.COST_BUDGET, 0.05)
+                .call(() -> {
+                    long start = System.currentTimeMillis();
+                    int maxRetries = 3;
+                    int attempt = 0;
 
-        while (attempt <= maxRetries) {
-            try {
-                AgentResponse agentResponse = CompletableFuture
-                        .supplyAsync(() -> orchestrator.run(event.getPrompt()), virtualThreadExecutor)
-                        .join();
+                    while (attempt <= maxRetries) {
+                        try {
+                            AgentResponse agentResponse = CompletableFuture
+                                    .supplyAsync(() -> orchestrator.run(event.getPrompt()), virtualThreadExecutor)
+                                    .join();
 
-                switch (agentResponse) {
-                    case SuccessResponse(var answer, var iterationsUsed, var maxIterations,
-                                         var toolsInvoked, var durationMs, var totalTokensUsed) -> {
-                        result.setAnswer(answer);
-                        result.setIterationsUsed(iterationsUsed);
-                        result.setToolsInvoked(toolsInvoked);
-                        result.setTotalTokensUsed(totalTokensUsed);
-                        result.setDurationMs(durationMs);
-                        result.setStatus(ResultStatus.SUCCESS);
-                    }
-                    case BudgetExceededResponse(var totalTokensUsed, var maxCostTokens,
-                                                var toolsInvoked, var durationMs) -> {
-                        result.setStatus(ResultStatus.BUDGET_EXCEEDED);
-                        result.setErrorMessage("Budget exceeded: " + totalTokensUsed + "/" + maxCostTokens);
-                        result.setToolsInvoked(toolsInvoked);
-                        result.setTotalTokensUsed(totalTokensUsed);
-                    }
-                    case ErrorResponse(var message, var toolsInvoked, var durationMs, var totalTokensUsed) -> {
-                        result.setStatus(ResultStatus.FAILED);
-                        result.setErrorMessage(message);
-                        result.setToolsInvoked(toolsInvoked);
-                    }
-                    case IterationLimitResponse(var maxIterations, var toolsInvoked,
-                                                var durationMs, var totalTokensUsed) -> {
-                        result.setStatus(ResultStatus.ITERATION_LIMIT);
-                        result.setErrorMessage("Hit iteration limit: " + maxIterations);
-                        result.setToolsInvoked(toolsInvoked);
-                    }
-                }
+                            switch (agentResponse) {
+                                case SuccessResponse(var answer, var iterationsUsed, var maxIterations,
+                                                     var toolsInvoked, var durationMs, var totalTokensUsed) -> {
+                                    result.setAnswer(answer);
+                                    result.setIterationsUsed(iterationsUsed);
+                                    result.setToolsInvoked(toolsInvoked);
+                                    result.setTotalTokensUsed(totalTokensUsed);
+                                    result.setDurationMs(durationMs);
+                                    result.setStatus(ResultStatus.SUCCESS);
+                                }
+                                case BudgetExceededResponse(var totalTokensUsed, var maxCostTokens,
+                                                            var toolsInvoked, var durationMs) -> {
+                                    result.setStatus(ResultStatus.BUDGET_EXCEEDED);
+                                    result.setErrorMessage("Budget exceeded: " + totalTokensUsed + "/" + maxCostTokens);
+                                    result.setToolsInvoked(toolsInvoked);
+                                    result.setTotalTokensUsed(totalTokensUsed);
+                                }
+                                case ErrorResponse(var message, var toolsInvoked, var durationMs, var totalTokensUsed) -> {
+                                    result.setStatus(ResultStatus.FAILED);
+                                    result.setErrorMessage(message);
+                                    result.setToolsInvoked(toolsInvoked);
+                                }
+                                case IterationLimitResponse(var maxIterations, var toolsInvoked,
+                                                            var durationMs, var totalTokensUsed) -> {
+                                    result.setStatus(ResultStatus.ITERATION_LIMIT);
+                                    result.setErrorMessage("Hit iteration limit: " + maxIterations);
+                                    result.setToolsInvoked(toolsInvoked);
+                                }
+                            }
 
-                result.setProcessingMs(System.currentTimeMillis() - start);
-                kafkaTemplate.send("ai.results", event.getUserId(), result);
-                ack.acknowledge();
-                return;
+                            result.setProcessingMs(System.currentTimeMillis() - start);
+                            kafkaTemplate.send("ai.results", event.getUserId(), result);
+                            ack.acknowledge();
+                            return null;
 
-            } catch (Exception e) {
-                attempt++;
-                if (attempt > maxRetries) {
-                    log.error("All retries exhausted for requestId={}", event.getRequestId(), e);
-                    sendToDlt(event, e.getMessage());
-                    ack.acknowledge();
-                    return;
-                }
-                long backoff = (long) (1000 * Math.pow(2, attempt - 1));
-                log.warn("Retry {}/{} for requestId={}, backoff={}ms", attempt, maxRetries, event.getRequestId(), backoff);
-                Thread.sleep(backoff);
-            }
-        }
+                        } catch (Exception e) {
+                            attempt++;
+                            if (attempt > maxRetries) {
+                                log.error("All retries exhausted for requestId={}", event.getRequestId(), e);
+                                sendToDlt(event, e.getMessage());
+                                ack.acknowledge();
+                                return null;
+                            }
+                            long backoff = (long) (1000 * Math.pow(2, attempt - 1));
+                            log.warn("Retry {}/{} for requestId={}, backoff={}ms",
+                                    attempt, maxRetries, event.getRequestId(), backoff);
+                            Thread.sleep(backoff);
+                        }
+                    }
+                    return null;
+                });
     }
-
     private void sendToDlt(AIRequestEvent event, String reason) {
         jdbc.update(
                 "INSERT INTO failed_ai_requests (request_id, prompt, failure_reason, failed_at) VALUES (?, ?, ?, NOW())",
