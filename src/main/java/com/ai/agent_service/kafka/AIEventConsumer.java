@@ -14,6 +14,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.StructuredTaskScope;
 
 @Component
 public class AIEventConsumer {
@@ -34,6 +35,7 @@ public class AIEventConsumer {
 
     @KafkaListener(topics = "ai.requests", containerFactory = "kafkaListenerContainerFactory")
     public void consume(AIRequestEvent event, Acknowledgment ack) throws Exception {
+
         AIResultEvent result = new AIResultEvent();
         result.setRequestId(event.getRequestId());
         result.setCorrelationId(event.getCorrelationId());
@@ -49,9 +51,13 @@ public class AIEventConsumer {
 
         markProcessed(event.getRequestId());
 
-        ScopedValue.where(AgentContext.REQUEST_ID, event.getRequestId())
-                .where(AgentContext.USER_ID, event.getUserId())
-                .where(AgentContext.COST_BUDGET, 0.05)
+        String reqId = event.getRequestId();
+        String userId = event.getUserId();
+        double budget = 0.05;
+
+        ScopedValue.where(AgentContext.REQUEST_ID, reqId)
+                .where(AgentContext.USER_ID, userId)
+                .where(AgentContext.COST_BUDGET, budget)
                 .call(() -> {
                     long start = System.currentTimeMillis();
                     int maxRetries = 3;
@@ -59,9 +65,14 @@ public class AIEventConsumer {
 
                     while (attempt <= maxRetries) {
                         try {
-                            AgentResponse agentResponse = CompletableFuture
-                                    .supplyAsync(() -> orchestrator.run(event.getPrompt()), virtualThreadExecutor)
-                                    .join();
+                            // StructuredTaskScope — ScopedValue inherited automatically, no rebind needed
+                            AgentResponse agentResponse;
+                            try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+                                StructuredTaskScope.Subtask<AgentResponse> task =
+                                        scope.fork(() -> orchestrator.run(event.getPrompt()));
+                                scope.join().throwIfFailed();
+                                agentResponse = task.get();
+                            }
 
                             switch (agentResponse) {
                                 case SuccessResponse(var answer, var iterationsUsed, var maxIterations,
@@ -101,20 +112,21 @@ public class AIEventConsumer {
                         } catch (Exception e) {
                             attempt++;
                             if (attempt > maxRetries) {
-                                log.error("All retries exhausted for requestId={}", event.getRequestId(), e);
+                                log.error("All retries exhausted for requestId={}", reqId, e);
                                 sendToDlt(event, e.getMessage());
                                 ack.acknowledge();
                                 return null;
                             }
                             long backoff = (long) (1000 * Math.pow(2, attempt - 1));
                             log.warn("Retry {}/{} for requestId={}, backoff={}ms",
-                                    attempt, maxRetries, event.getRequestId(), backoff);
+                                    attempt, maxRetries, reqId, backoff);
                             Thread.sleep(backoff);
                         }
                     }
                     return null;
                 });
     }
+
     private void sendToDlt(AIRequestEvent event, String reason) {
         jdbc.update(
                 "INSERT INTO failed_ai_requests (request_id, prompt, failure_reason, failed_at) VALUES (?, ?, ?, NOW())",
